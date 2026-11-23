@@ -11,9 +11,10 @@ concurrency:
 
 jobs:
   # ==========================================
-  # JOB 1: PUBLIC SWAGGER PARSER (Port 8082)
+  # JOB 1: PUBLIC SWAGGER PARSER (Port 8082 + VPN)
   # ==========================================
   public-swagger:
+    if: vars.PUBLIC_SWAGGER_URL != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -26,16 +27,45 @@ jobs:
           cache: 'maven'
           cache-dependency-path: api-documentation-generator/pom.xml
 
-      - name: Build & Run api-documentation-generator
+      - name: Build api-documentation-generator
+        working-directory: ./api-documentation-generator
+        run: |
+          chmod +x mvnw
+          ./mvnw -B package -DskipTests
+
+      - name: Connect to OpenVPN
+        env:
+          VPN_CONFIG_BASE64: ${{ secrets.VPN_CONFIG_BASE64 }}
+          VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
+          VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq openvpn
+          echo "$VPN_CONFIG_BASE64" | base64 -d > /tmp/vpn.ovpn
+          printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn-auth.txt
+          chmod 600 /tmp/vpn-auth.txt
+          sudo openvpn --config /tmp/vpn.ovpn --auth-user-pass /tmp/vpn-auth.txt --daemon --log /tmp/openvpn.log
+
+          for i in $(seq 1 30); do
+            if ip a show tun0 >/dev/null 2>&1; then
+              echo "OpenVPN connected (tun0 is up)!"
+              break
+            fi
+            sleep 2
+          done
+
+          if ! ip a show tun0 >/dev/null 2>&1; then
+            echo "OpenVPN failed to connect:"
+            cat /tmp/openvpn.log
+            exit 1
+          fi
+
+      - name: Run api-documentation-generator
         working-directory: ./api-documentation-generator
         env:
           PUBLIC_SWAGGER_URL: ${{ vars.PUBLIC_SWAGGER_URL }}
           PUBLIC_PROJECT_NAME: ${{ vars.PUBLIC_PROJECT_NAME }}
           PUBLIC_SWAGGER_TOKEN: ${{ secrets.PUBLIC_SWAGGER_TOKEN }}
         run: |
-          chmod +x mvnw
-          ./mvnw -B package -DskipTests
-
           JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*original*" | head -n 1)
           java -jar "$JAR_FILE" > /tmp/app.log 2>&1 &
           APP_PID=$!
@@ -64,6 +94,12 @@ jobs:
           LATEST_JSON=$(ls -t generated/*.json | head -n 1)
           cp "$LATEST_JSON" public-swagger.json
 
+      - name: Disconnect OpenVPN
+        if: always()
+        run: |
+          sudo killall openvpn || true
+          rm -f /tmp/vpn.ovpn /tmp/vpn-auth.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: public-swagger
@@ -71,7 +107,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # JOB 2: LIFERAY API ANALYZER (Port 8082)
+  # JOB 2: LIFERAY API ANALYZER (Port 8082 + VPN)
   # ==========================================
   liferay-analyzer:
     runs-on: ubuntu-latest
@@ -86,16 +122,45 @@ jobs:
           cache: 'maven'
           cache-dependency-path: liferay-api-analyzer/pom.xml
 
-      - name: Build & Run liferay-api-analyzer
+      - name: Build liferay-api-analyzer
+        working-directory: ./liferay-api-analyzer
+        run: |
+          chmod +x mvnw
+          ./mvnw -B package -DskipTests
+
+      - name: Connect to OpenVPN
+        env:
+          VPN_CONFIG_BASE64: ${{ secrets.VPN_CONFIG_BASE64 }}
+          VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
+          VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq openvpn
+          echo "$VPN_CONFIG_BASE64" | base64 -d > /tmp/vpn.ovpn
+          printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn-auth.txt
+          chmod 600 /tmp/vpn-auth.txt
+          sudo openvpn --config /tmp/vpn.ovpn --auth-user-pass /tmp/vpn-auth.txt --daemon --log /tmp/openvpn.log
+
+          for i in $(seq 1 30); do
+            if ip a show tun0 >/dev/null 2>&1; then
+              echo "OpenVPN connected (tun0 is up)!"
+              break
+            fi
+            sleep 2
+          done
+
+          if ! ip a show tun0 >/dev/null 2>&1; then
+            echo "OpenVPN failed to connect:"
+            cat /tmp/openvpn.log
+            exit 1
+          fi
+
+      - name: Run liferay-api-analyzer
         working-directory: ./liferay-api-analyzer
         env:
           LIFERAY_BASE_URL: ${{ vars.LIFERAY_BASE_URL }}
           LIFERAY_CLIENT_ID: ${{ secrets.LIFERAY_CLIENT_ID }}
           LIFERAY_CLIENT_SECRET: ${{ secrets.LIFERAY_CLIENT_SECRET }}
         run: |
-          chmod +x mvnw
-          ./mvnw -B package -DskipTests
-
           JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*original*" | head -n 1)
           java -jar "$JAR_FILE" > /tmp/app.log 2>&1 &
           APP_PID=$!
@@ -114,6 +179,12 @@ jobs:
           LATEST_JSON=$(ls -t generated/*.json | head -n 1)
           cp "$LATEST_JSON" liferay-api.json
 
+      - name: Disconnect OpenVPN
+        if: always()
+        run: |
+          sudo killall openvpn || true
+          rm -f /tmp/vpn.ovpn /tmp/vpn-auth.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: liferay
@@ -121,7 +192,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # JOB 3: SOURCE CODE ANALYZER (Port 8080)
+  # JOB 3: SOURCE CODE ANALYZER (Port 8080 + Azure)
   # ==========================================
   source-code-analyzer:
     runs-on: ubuntu-latest
@@ -138,10 +209,13 @@ jobs:
 
       - name: Clone Source Code from Azure DevOps
         env:
-          AZURE_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZURE_USERNAME: ${{ secrets.AZURE_USERNAME }}
+          AZURE_PASSWORD: ${{ secrets.AZURE_PASSWORD }}
           AZURE_REPO_URL: ${{ vars.AZURE_REPO_URL }}
         run: |
-          git clone --depth 1 "https://pat:${AZURE_PAT}@${AZURE_REPO_URL}" /tmp/azure-source-code
+          ENC_USER=$(jq -rn --arg v "$AZURE_USERNAME" '$v|@uri')
+          ENC_PASS=$(jq -rn --arg v "$AZURE_PASSWORD" '$v|@uri')
+          git clone --depth 1 "https://${ENC_USER}:${ENC_PASS}@${AZURE_REPO_URL}" /tmp/azure-source-code
 
       - name: Build & Run source-code-analyzer
         working-directory: ./source-code-analyzer
@@ -182,6 +256,7 @@ jobs:
   # ==========================================
   push-to-central-hub:
     needs: [public-swagger, liferay-analyzer, source-code-analyzer]
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
