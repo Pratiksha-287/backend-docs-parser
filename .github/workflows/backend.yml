@@ -41,6 +41,9 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq openvpn
           echo "$VPN_CONFIG_BASE64" | base64 -d > /tmp/vpn.ovpn
+          sed -i 's/\r$//' /tmp/vpn.ovpn
+          sed -i '/block-outside-dns/d' /tmp/vpn.ovpn
+
           printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn-auth.txt
           chmod 600 /tmp/vpn-auth.txt
           sudo openvpn --config /tmp/vpn.ovpn --auth-user-pass /tmp/vpn-auth.txt --daemon --log /tmp/openvpn.log
@@ -55,7 +58,7 @@ jobs:
 
           if ! ip a show tun0 >/dev/null 2>&1; then
             echo "OpenVPN failed to connect:"
-            cat /tmp/openvpn.log
+            sudo cat /tmp/openvpn.log
             exit 1
           fi
 
@@ -84,9 +87,14 @@ jobs:
               '{sourceUrl: $url, projectName: $name}')
           fi
 
-          curl -f --max-time 180 -X POST "http://localhost:8082/api/v1/documentation/generate/url" \
+          if ! curl -f --max-time 180 -X POST "http://localhost:8082/api/v1/documentation/generate/url" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD"
+            -d "$PAYLOAD"; then
+            echo "=== api-documentation-generator App Log ==="
+            cat /tmp/app.log
+            kill -TERM "$APP_PID" || true
+            exit 1
+          fi
 
           kill -TERM "$APP_PID" || true
           wait "$APP_PID" 2>/dev/null || true
@@ -136,6 +144,9 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq openvpn
           echo "$VPN_CONFIG_BASE64" | base64 -d > /tmp/vpn.ovpn
+          sed -i 's/\r$//' /tmp/vpn.ovpn
+          sed -i '/block-outside-dns/d' /tmp/vpn.ovpn
+
           printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn-auth.txt
           chmod 600 /tmp/vpn-auth.txt
           sudo openvpn --config /tmp/vpn.ovpn --auth-user-pass /tmp/vpn-auth.txt --daemon --log /tmp/openvpn.log
@@ -150,7 +161,7 @@ jobs:
 
           if ! ip a show tun0 >/dev/null 2>&1; then
             echo "OpenVPN failed to connect:"
-            cat /tmp/openvpn.log
+            sudo cat /tmp/openvpn.log
             exit 1
           fi
 
@@ -171,7 +182,12 @@ jobs:
             sleep 2
           done
 
-          curl -f --max-time 180 -X POST "http://localhost:8082/api/analyzer/discover/generate"
+          if ! curl -f --max-time 180 -X POST "http://localhost:8082/api/analyzer/discover/generate"; then
+            echo "=== liferay-api-analyzer App Log ==="
+            cat /tmp/app.log
+            kill -TERM "$APP_PID" || true
+            exit 1
+          fi
 
           kill -TERM "$APP_PID" || true
           wait "$APP_PID" 2>/dev/null || true
@@ -233,10 +249,15 @@ jobs:
             sleep 2
           done
 
-          curl -f --max-time 180 -X POST "http://localhost:8080/api/analyzer/scan" \
+          if ! curl -f --max-time 180 -X POST "http://localhost:8080/api/analyzer/scan" \
             -H "Content-Type: application/json" \
             -d '{"repositoryPath": "/tmp/azure-source-code"}' \
-            -o source-code.json
+            -o source-code.json; then
+            echo "=== source-code-analyzer App Log ==="
+            cat /tmp/app.log
+            kill -TERM "$APP_PID" || true
+            exit 1
+          fi
 
           kill -TERM "$APP_PID" || true
           wait "$APP_PID" 2>/dev/null || true
