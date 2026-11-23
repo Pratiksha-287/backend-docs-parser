@@ -11,7 +11,7 @@ concurrency:
 
 jobs:
   # ==========================================
-  # JOB 1: PUBLIC SWAGGER PARSER (Port 8082 + VPN)
+  # JOB 1: PUBLIC SWAGGER PARSER (Port 8082 - No VPN)
   # ==========================================
   public-swagger:
     if: vars.PUBLIC_SWAGGER_URL != ''
@@ -27,48 +27,16 @@ jobs:
           cache: 'maven'
           cache-dependency-path: api-documentation-generator/pom.xml
 
-      - name: Build api-documentation-generator
-        working-directory: ./api-documentation-generator
-        run: |
-          chmod +x mvnw
-          ./mvnw -B package -DskipTests
-
-      - name: Connect to OpenVPN
-        env:
-          VPN_CONFIG_BASE64: ${{ secrets.VPN_CONFIG_BASE64 }}
-          VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
-          VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq openvpn
-          echo "$VPN_CONFIG_BASE64" | base64 -d > /tmp/vpn.ovpn
-          sed -i 's/\r$//' /tmp/vpn.ovpn
-          sed -i '/block-outside-dns/d' /tmp/vpn.ovpn
-
-          printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn-auth.txt
-          chmod 600 /tmp/vpn-auth.txt
-          sudo openvpn --config /tmp/vpn.ovpn --auth-user-pass /tmp/vpn-auth.txt --daemon --log /tmp/openvpn.log
-
-          for i in $(seq 1 30); do
-            if ip a show tun0 >/dev/null 2>&1; then
-              echo "OpenVPN connected (tun0 is up)!"
-              break
-            fi
-            sleep 2
-          done
-
-          if ! ip a show tun0 >/dev/null 2>&1; then
-            echo "OpenVPN failed to connect:"
-            sudo cat /tmp/openvpn.log
-            exit 1
-          fi
-
-      - name: Run api-documentation-generator
+      - name: Build & Run api-documentation-generator
         working-directory: ./api-documentation-generator
         env:
           PUBLIC_SWAGGER_URL: ${{ vars.PUBLIC_SWAGGER_URL }}
           PUBLIC_PROJECT_NAME: ${{ vars.PUBLIC_PROJECT_NAME }}
           PUBLIC_SWAGGER_TOKEN: ${{ secrets.PUBLIC_SWAGGER_TOKEN }}
         run: |
+          chmod +x mvnw
+          ./mvnw -B package -DskipTests
+
           JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*original*" | head -n 1)
           java -jar "$JAR_FILE" > /tmp/app.log 2>&1 &
           APP_PID=$!
@@ -102,12 +70,6 @@ jobs:
           LATEST_JSON=$(ls -t generated/*.json | head -n 1)
           cp "$LATEST_JSON" public-swagger.json
 
-      - name: Disconnect OpenVPN
-        if: always()
-        run: |
-          sudo killall openvpn || true
-          rm -f /tmp/vpn.ovpn /tmp/vpn-auth.txt
-
       - uses: actions/upload-artifact@v4
         with:
           name: public-swagger
@@ -136,20 +98,41 @@ jobs:
           chmod +x mvnw
           ./mvnw -B package -DskipTests
 
+      - name: Cache OpenVPN Packages
+        id: cache-openvpn
+        uses: actions/cache@v4
+        with:
+          path: ~/openvpn-debs
+          key: ${{ runner.os }}-openvpn-debs-v1
+
       - name: Connect to OpenVPN
         env:
           VPN_CONFIG_BASE64: ${{ secrets.VPN_CONFIG_BASE64 }}
           VPN_USERNAME: ${{ secrets.VPN_USERNAME }}
           VPN_PASSWORD: ${{ secrets.VPN_PASSWORD }}
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq openvpn
+          if [ "${{ steps.cache-openvpn.outputs.cache-hit }}" == "true" ]; then
+            echo "Installing OpenVPN from cache..."
+            sudo DEBIAN_FRONTEND=noninteractive dpkg -i ~/openvpn-debs/*.deb || (sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq)
+          else
+            echo "Downloading and caching OpenVPN..."
+            mkdir -p ~/openvpn-debs
+            sudo apt-get update -qq
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+              -o dir::cache::archives="$HOME/openvpn-debs" openvpn
+          fi
+
           echo "$VPN_CONFIG_BASE64" | base64 -d > /tmp/vpn.ovpn
           sed -i 's/\r$//' /tmp/vpn.ovpn
           sed -i '/block-outside-dns/d' /tmp/vpn.ovpn
 
           printf "%s\n%s\n" "$VPN_USERNAME" "$VPN_PASSWORD" > /tmp/vpn-auth.txt
           chmod 600 /tmp/vpn-auth.txt
-          sudo openvpn --config /tmp/vpn.ovpn --auth-user-pass /tmp/vpn-auth.txt --daemon --log /tmp/openvpn.log
+
+          sudo openvpn --config /tmp/vpn.ovpn \
+            --auth-user-pass /tmp/vpn-auth.txt \
+            --disable-dco \
+            --verb 3 > /tmp/openvpn.log 2>&1 &
 
           for i in $(seq 1 30); do
             if ip a show tun0 >/dev/null 2>&1; then
@@ -208,7 +191,7 @@ jobs:
           retention-days: 1
 
   # ==========================================
-  # JOB 3: SOURCE CODE ANALYZER (Port 8080 + Azure)
+  # JOB 3: SOURCE CODE ANALYZER (Port 8080 - No VPN)
   # ==========================================
   source-code-analyzer:
     runs-on: ubuntu-latest
