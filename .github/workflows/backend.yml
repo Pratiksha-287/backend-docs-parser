@@ -2,7 +2,7 @@ name: Pipeline 2 - Backend Docs Generator
 
 on:
   # schedule:
-  #   - cron: '30 18 * * *' # Testing ke baad uncomment kar lena
+  #   - cron: '30 18 * * *' # Testing pass hone ke baad uncomment kar lena
   workflow_dispatch:
 
 concurrency:
@@ -10,146 +10,190 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  generate-backend-json:
+  # ==========================================
+  # JOB 1: PUBLIC SWAGGER PARSER (Port 8082)
+  # ==========================================
+  public-swagger:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout Backend Parser Repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Java 21 (with Maven Cache)
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '21'
           cache: 'maven'
+          cache-dependency-path: api-documentation-generator/pom.xml
 
-      - name: Prepare Unified Output Directory
-        run: mkdir -p output
-
-      # ==========================================
-      # 1. PUBLIC SWAGGER PARSER
-      # ==========================================
       - name: Build & Run api-documentation-generator
         working-directory: ./api-documentation-generator
         env:
           PUBLIC_SWAGGER_URL: ${{ vars.PUBLIC_SWAGGER_URL }}
-          PUBLIC_SWAGGER_BODY: ${{ secrets.PUBLIC_SWAGGER_BODY }}
+          PUBLIC_PROJECT_NAME: ${{ vars.PUBLIC_PROJECT_NAME }}
+          PUBLIC_SWAGGER_TOKEN: ${{ secrets.PUBLIC_SWAGGER_TOKEN }}
         run: |
           chmod +x mvnw
-          ./mvnw clean package -DskipTests
+          ./mvnw -B package -DskipTests
 
-          # App ko background mein start karo (port 8080)
-          java -jar target/*.jar --server.port=8080 > /tmp/api-doc-gen.log 2>&1 &
+          JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*original*" | head -n 1)
+          java -jar "$JAR_FILE" > /tmp/app.log 2>&1 &
           APP_PID=$!
 
-          # Wait jab tak server port 8080 par ready na ho jaye (max 60s)
           for i in $(seq 1 30); do
-            if curl -s http://localhost:8080 >/dev/null 2>&1; then
-              echo "api-documentation-generator is up!"
-              break
-            fi
+            if curl -s -o /dev/null http://localhost:8082; then break; fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then cat /tmp/app.log; exit 1; fi
             sleep 2
           done
 
-          # TODO: Yahan exact endpoint aur request body update kar dena
-          curl -f --max-time 180 -X POST "http://localhost:8080/api/generate" \
-            -H "Content-Type: application/json" \
-            -d "$PUBLIC_SWAGGER_BODY"
+          if [ -n "$PUBLIC_SWAGGER_TOKEN" ]; then
+            PAYLOAD=$(jq -n --arg url "$PUBLIC_SWAGGER_URL" --arg name "${PUBLIC_PROJECT_NAME:-Public API}" --arg tok "$PUBLIC_SWAGGER_TOKEN" \
+              '{sourceUrl: $url, projectName: $name, authentication: {type: "BEARER", token: $tok}}')
+          else
+            PAYLOAD=$(jq -n --arg url "$PUBLIC_SWAGGER_URL" --arg name "${PUBLIC_PROJECT_NAME:-Public API}" \
+              '{sourceUrl: $url, projectName: $name}')
+          fi
 
-          # Server band karo aur generated JSON copy karo
+          curl -f --max-time 180 -X POST "http://localhost:8082/api/v1/documentation/generate/url" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
           kill -TERM "$APP_PID" || true
           wait "$APP_PID" 2>/dev/null || true
 
-          mkdir -p ../output/public-swagger
-          cp -r generated/*.json ../output/public-swagger/ || true
+          LATEST_JSON=$(ls -t generated/*.json | head -n 1)
+          cp "$LATEST_JSON" public-swagger.json
 
-      # ==========================================
-      # 2. LIFERAY API ANALYZER
-      # ==========================================
+      - uses: actions/upload-artifact@v4
+        with:
+          name: public-swagger
+          path: api-documentation-generator/public-swagger.json
+          retention-days: 1
+
+  # ==========================================
+  # JOB 2: LIFERAY API ANALYZER (Port 8082)
+  # ==========================================
+  liferay-analyzer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+          cache-dependency-path: liferay-api-analyzer/pom.xml
+
       - name: Build & Run liferay-api-analyzer
         working-directory: ./liferay-api-analyzer
         env:
-          LIFERAY_URL: ${{ vars.LIFERAY_URL }}
+          LIFERAY_BASE_URL: ${{ vars.LIFERAY_BASE_URL }}
           LIFERAY_CLIENT_ID: ${{ secrets.LIFERAY_CLIENT_ID }}
           LIFERAY_CLIENT_SECRET: ${{ secrets.LIFERAY_CLIENT_SECRET }}
         run: |
           chmod +x mvnw
-          ./mvnw clean package -DskipTests
+          ./mvnw -B package -DskipTests
 
-          java -jar target/*.jar --server.port=8080 > /tmp/liferay-analyzer.log 2>&1 &
+          JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*original*" | head -n 1)
+          java -jar "$JAR_FILE" > /tmp/app.log 2>&1 &
           APP_PID=$!
 
           for i in $(seq 1 30); do
-            if curl -s http://localhost:8080 >/dev/null 2>&1; then
-              echo "liferay-api-analyzer is up!"
-              break
-            fi
+            if curl -s -o /dev/null http://localhost:8082; then break; fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then cat /tmp/app.log; exit 1; fi
             sleep 2
           done
 
-          # TODO: Yahan Liferay analyzer ka exact endpoint update kar dena
-          curl -f --max-time 180 -X POST "http://localhost:8080/api/liferay/analyze" \
-            -H "Content-Type: application/json"
+          curl -f --max-time 180 -X POST "http://localhost:8082/api/analyzer/discover/generate"
 
           kill -TERM "$APP_PID" || true
           wait "$APP_PID" 2>/dev/null || true
 
-          mkdir -p ../output/liferay
-          cp -r generated/*.json ../output/liferay/ || true
+          LATEST_JSON=$(ls -t generated/*.json | head -n 1)
+          cp "$LATEST_JSON" liferay-api.json
 
-      # ==========================================
-      # 3. SOURCE CODE ANALYZER (AZURE CLONE + CLEANUP)
-      # ==========================================
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liferay
+          path: liferay-api-analyzer/liferay-api.json
+          retention-days: 1
+
+  # ==========================================
+  # JOB 3: SOURCE CODE ANALYZER (Port 8080)
+  # ==========================================
+  source-code-analyzer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'maven'
+          cache-dependency-path: source-code-analyzer/pom.xml
+
       - name: Clone Source Code from Azure DevOps
         env:
           AZURE_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
-          AZURE_REPO_URL: ${{ vars.AZURE_REPO_URL }} # e.g. dev.azure.com/org/proj/_git/repo
+          AZURE_REPO_URL: ${{ vars.AZURE_REPO_URL }}
         run: |
           git clone --depth 1 "https://pat:${AZURE_PAT}@${AZURE_REPO_URL}" /tmp/azure-source-code
 
       - name: Build & Run source-code-analyzer
         working-directory: ./source-code-analyzer
-        env:
-          SOURCE_CODE_PATH: /tmp/azure-source-code
         run: |
           chmod +x mvnw
-          ./mvnw clean package -DskipTests
+          ./mvnw -B package -DskipTests
 
-          java -jar target/*.jar --server.port=8080 > /tmp/source-analyzer.log 2>&1 &
+          JAR_FILE=$(find target -maxdepth 1 -name "*.jar" ! -name "*original*" | head -n 1)
+          java -jar "$JAR_FILE" > /tmp/app.log 2>&1 &
           APP_PID=$!
 
           for i in $(seq 1 30); do
-            if curl -s http://localhost:8080 >/dev/null 2>&1; then
-              echo "source-code-analyzer is up!"
-              break
-            fi
+            if curl -s -o /dev/null http://localhost:8080; then break; fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then cat /tmp/app.log; exit 1; fi
             sleep 2
           done
 
-          # TODO: Yahan source-code-analyzer ka exact endpoint & payload update kar dena
-          curl -f --max-time 180 -X POST "http://localhost:8080/api/analyze" \
+          curl -f --max-time 180 -X POST "http://localhost:8080/api/analyzer/scan" \
             -H "Content-Type: application/json" \
-            -d '{"path": "/tmp/azure-source-code"}'
+            -d '{"repositoryPath": "/tmp/azure-source-code"}' \
+            -o source-code.json
 
           kill -TERM "$APP_PID" || true
           wait "$APP_PID" 2>/dev/null || true
-
-          mkdir -p ../output/source-code
-          cp -r generated/*.json ../output/source-code/ || true
 
       - name: Cleanup Cloned Source Code
         if: always()
         run: rm -rf /tmp/azure-source-code
 
-      # ==========================================
-      # 4. NORMALIZE JSON, SHA-256 & PUSH TO CENTRAL HUB
-      # ==========================================
-      - name: Normalize JSON, Compare SHA-256 & Push to Central Docs Repo
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-code
+          path: source-code-analyzer/source-code.json
+          retention-days: 1
+
+  # ==========================================
+  # JOB 4: SHA-256 DEDUP, PUSH & DISPATCH
+  # ==========================================
+  push-to-central-hub:
+    needs: [public-swagger, liferay-analyzer, source-code-analyzer]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download Generated JSONs
+        uses: actions/download-artifact@v4
+        with:
+          path: output
+
+      - name: Normalize JSON, Compare SHA-256 & Push
         id: push_data
         run: |
-          git clone https://x-access-token:${{ secrets.CENTRAL_REPO_PAT }}@github.com/harshh122/central-docs-hub.git central-docs
+          git clone --depth 1 https://x-access-token:${{ secrets.CENTRAL_REPO_PAT }}@github.com/harshh122/central-docs-hub.git central-docs
           mkdir -p central-docs/backend
 
           find output -type f -name "*.json" | while read -r file; do
@@ -185,9 +229,6 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # ==========================================
-      # 5. TRIGGER PIPELINE 3
-      # ==========================================
       - name: Trigger Central Hub (Pipeline 3)
         if: steps.push_data.outputs.changed == 'true'
         uses: peter-evans/repository-dispatch@v3
